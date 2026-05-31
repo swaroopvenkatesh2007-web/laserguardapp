@@ -1,1 +1,255 @@
+/*
+ * ================================================================
+ *  LASER GUARD SECURITY SYSTEM  —  v2  (matches KiCad schematic)
+ *  File: Schematic Represntation.kicad_sch
+ * ================================================================
+ *
+ *  EXACT PIN MAPPING FROM YOUR SCHEMATIC
+ *  ──────────────────────────────────────
+ *
+ *  Arduino Nano ←→ A7670C GSM Module
+ *    D0 / RX  ──────── A7670C TX        (Hardware Serial — J4 pin 2)
+ *    D1 / TX  ──────── A7670C RX        (Hardware Serial — J4 pin 1)
+ *    GND      ──────── A7670C GND       (J4 pin 3)
+ *    +5V rail ──────── A7670C VCC       (J4 pin 4)
+ *
+ *  Arduino Nano ←→ Laser (KY-008 via 2N2222 transistor Q1)
+ *    D2       ──────── R2 (1kΩ) ── Base of Q1 (2N2222)
+ *                      Collector Q1 ── Laser J1 pin 1 (VCC side)
+ *                      Emitter   Q1 ── GND
+ *    Laser J1 pin 2 ── GND
+ *    NOTE: D2 HIGH = transistor ON = Laser ON
+ *          D2 LOW  = transistor OFF = Laser OFF
+ *
+ *  Arduino Nano ←→ LDR Sensor
+ *    A0       ──────── R_Photo (LDR) junction with R3 (10kΩ)
+ *                      R3 top ── +5V
+ *                      LDR bottom ── GND
+ *                      (Voltage divider: A0 reads HIGH in light,
+ *                       LOW when beam is blocked)
+ *    J3 pin 3 ──────── LDR_SIG (same A0 net)
+ *
+ *  Power Decoupling (on +5V rail)
+ *    C1 100µF electrolytic ── across VCC / GND  (bulk)
+ *    C2 100nF ceramic      ── across VCC / GND  (HF bypass)
+ *
+ *  ⚠️  IMPORTANT NOTES
+ *  ────────────────────
+ *  1. Hardware Serial (D0/D1) is used for A7670C. This means the
+ *     Arduino IDE Serial Monitor CANNOT be used simultaneously.
+ *     Upload code first, then connect GSM module. Or use a USB-TTL
+ *     adapter on a separate SoftwareSerial port for debug.
+ *
+ *  2. Power A7670C from your 5V 2A USB adapter via JST/DC terminal
+ *     directly — NOT from the Nano 5V pin (max 500mA).
+ *     Share GND between Nano and A7670C.
+ *
+ *  3. 2N2222 transistor safely switches laser current.
+ *     R2 = 1kΩ (base resistor) already in schematic.
+ *     No changes needed there.
+ *
+ *  4. Set LDR_THRESHOLD after measuring your environment:
+ *     Typical: beam intact ≈ 700–900, beam broken ≈ 100–300
+ * ================================================================
+ */
+
+// ── Pin Definitions (from schematic) ─────────────────────────
+#define LASER_EN_PIN    2     // D2 → R2(1kΩ) → Base of Q1(2N2222) → Laser
+#define LDR_PIN         A0    // Voltage divider: R3(10kΩ) + R_Photo(LDR)
+#define STATUS_LED      13    // Built-in LED on Nano
+
+// ── GSM uses Hardware Serial (D0/D1) ─────────────────────────
+//    Arduino Nano HardwareSerial = "Serial"
+//    A7670C TX → D0(RX), A7670C RX → D1(TX)
+#define gsmSerial       Serial   // Alias for clarity
+
+// ── User Configuration ────────────────────────────────────────
+const char ALERT_NUMBER[]        = "+91XXXXXXXXXX";  // ← Your number with country code
+const int  LDR_THRESHOLD         = 400;              // Tune: beam-intact > threshold > beam-broken
+const unsigned long COOLDOWN_MS  = 30000UL;          // 30s between repeated alerts
+const unsigned long CALL_DURATION= 20000UL;          // Ring for 20s then auto-hangup
+const unsigned long GSM_TIMEOUT  = 8000UL;           // AT command response timeout
+const int  LDR_SAMPLES           = 5;                // Averaged readings (noise reduction)
+
+// ── Runtime State ─────────────────────────────────────────────
+bool     beamWasBroken  = false;
+bool     gsmReady       = false;
+unsigned long lastAlert = 0;
+
+// ── Prototypes ────────────────────────────────────────────────
+void  laserOn();
+void  laserOff();
+int   readLDR();
+bool  sendAT(const char* cmd, const char* ack, unsigned long timeout);
+void  gsmInit();
+void  sendSMS(const char* number, const char* msg);
+void  makeCall(const char* number);
+void  hangUp();
+void  triggerAlert();
+void  blinkLED(int n, int ms);
+
+// ================================================================
+void setup() {
+  pinMode(LASER_EN_PIN, OUTPUT);
+  pinMode(STATUS_LED,   OUTPUT);
+
+  // Hardware Serial for A7670C
+  // NOTE: Do not open Serial Monitor while GSM is connected to D0/D1
+  gsmSerial.begin(9600);
+
+  laserOn();          // Energise laser beam immediately
+  delay(500);
+
+  gsmInit();          // Bring up A7670C
+
+  blinkLED(3, 300);   // 3 blinks = system armed
+}
+
+// ================================================================
+void loop() {
+  int ldr = readLDR();
+
+  // Beam broken when LDR value drops below threshold
+  bool broken = (ldr < LDR_THRESHOLD);
+
+  if (broken && !beamWasBroken) {
+    // ── Rising edge: beam just got cut ──
+    beamWasBroken = true;
+    digitalWrite(STATUS_LED, HIGH);
+
+    unsigned long now = millis();
+    if (now - lastAlert > COOLDOWN_MS) {
+      lastAlert = now;
+      triggerAlert();   // SMS + Call
+    }
+    // else: cooldown active, silent
+  }
+
+  if (!broken && beamWasBroken) {
+    // ── Beam restored ──
+    beamWasBroken = false;
+    digitalWrite(STATUS_LED, LOW);
+  }
+
+  delay(150);   // ~6 checks per second
+}
+
+// ── Laser Control (via 2N2222 transistor on D2) ──────────────
+void laserOn() {
+  digitalWrite(LASER_EN_PIN, HIGH);   // Q1 ON → Laser ON
+}
+
+void laserOff() {
+  digitalWrite(LASER_EN_PIN, LOW);    // Q1 OFF → Laser OFF
+}
+
+// ── LDR Average Read ─────────────────────────────────────────
+int readLDR() {
+  long sum = 0;
+  for (int i = 0; i < LDR_SAMPLES; i++) {
+    sum += analogRead(LDR_PIN);
+    delay(10);
+  }
+  return (int)(sum / LDR_SAMPLES);
+}
+
+// ── AT Command Handler ───────────────────────────────────────
+bool sendAT(const char* cmd, const char* ack, unsigned long timeout) {
+  // Flush incoming buffer
+  while (gsmSerial.available()) gsmSerial.read();
+
+  gsmSerial.println(cmd);
+
+  String resp = "";
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+    while (gsmSerial.available()) {
+      resp += (char)gsmSerial.read();
+    }
+    if (resp.indexOf(ack) != -1) return true;
+  }
+  return false;   // Timeout
+}
+
+// ── GSM Init ─────────────────────────────────────────────────
+void gsmInit() {
+  delay(4000);   // Allow A7670C full boot time
+
+  // Retry AT handshake up to 5 times
+  for (int i = 0; i < 5; i++) {
+    if (sendAT("AT", "OK", GSM_TIMEOUT)) break;
+    delay(1000);
+  }
+
+  sendAT("ATE0",           "OK", GSM_TIMEOUT);   // Echo off
+  sendAT("AT+CMGF=1",      "OK", GSM_TIMEOUT);   // SMS text mode
+  sendAT("AT+CSCS=\"GSM\"","OK", GSM_TIMEOUT);   // GSM charset
+  sendAT("AT+CREG?",       "OK", GSM_TIMEOUT);   // Verify network registration
+
+  gsmReady = true;
+}
+
+// ── Send SMS ─────────────────────────────────────────────────
+void sendSMS(const char* number, const char* msg) {
+  if (!gsmReady) return;
+
+  // Set recipient
+  gsmSerial.print(F("AT+CMGS=\""));
+  gsmSerial.print(number);
+  gsmSerial.println(F("\""));
+  delay(1500);   // Wait for '>' prompt
+
+  // Send message body + Ctrl+Z
+  gsmSerial.print(msg);
+  delay(100);
+  gsmSerial.write(26);   // ASCII 26 = Ctrl+Z = send trigger
+
+  // Wait for +CMGS confirmation (up to 10s)
+  String resp = "";
+  unsigned long start = millis();
+  while (millis() - start < 10000UL) {
+    while (gsmSerial.available()) resp += (char)gsmSerial.read();
+    if (resp.indexOf("+CMGS:") != -1) return;   // Success
+  }
+  // Timeout — SMS may have failed (no signal / no credit)
+}
+
+// ── Make Voice Call ──────────────────────────────────────────
+void makeCall(const char* number) {
+  if (!gsmReady) return;
+
+  gsmSerial.print(F("ATD"));
+  gsmSerial.print(number);
+  gsmSerial.println(F(";"));    // ';' suffix = voice call mode
+
+  delay(CALL_DURATION);         // Let it ring for configured duration
+  hangUp();
+}
+
+// ── Hang Up ──────────────────────────────────────────────────
+void hangUp() {
+  sendAT("ATH", "OK", GSM_TIMEOUT);
+}
+
+// ── Full Alert: SMS then Call ─────────────────────────────────
+void triggerAlert() {
+  // Flash LED rapidly during alert
+  blinkLED(6, 100);
+
+  sendSMS(ALERT_NUMBER,
+    "ALERT! Laser beam broken - INTRUSION DETECTED! Check your location immediately.");
+
+  delay(3000);   // Small gap between SMS and call
+
+  makeCall(ALERT_NUMBER);
+}
+
+// ── Blink Status LED ─────────────────────────────────────────
+void blinkLED(int n, int ms) {
+  for (int i = 0; i < n; i++) {
+    digitalWrite(STATUS_LED, HIGH); delay(ms);
+    digitalWrite(STATUS_LED, LOW);  delay(ms);
+  }
+}
 
