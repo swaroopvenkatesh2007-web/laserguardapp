@@ -1,0 +1,266 @@
+/*
+ * ============================================================
+ *  LASER GUARD SECURITY SYSTEM
+ *  Hardware: Arduino Nano + KY-008 Laser + LDR + A7670C GSM
+ * ============================================================
+ *
+ *  WIRING SUMMARY
+ *  ──────────────
+ *  KY-008 Laser Module:
+ *    S (signal) → D7 (OUTPUT - controls laser ON/OFF)
+ *    VCC        → 5V
+ *    GND        → GND
+ *
+ *  LDR Sensor Module (with onboard comparator):
+ *    AO (analog out) → A0
+ *    DO (digital out)→ D8  (optional, can use analog threshold instead)
+ *    VCC             → 5V
+ *    GND             → GND
+ *    [10kΩ pull-down resistor between A0 and GND if using raw LDR]
+ *
+ *  A7670C GSM Module:
+ *    TX  → D2  (Arduino RX via SoftwareSerial)
+ *    RX  → D3  (Arduino TX via SoftwareSerial)
+ *    VCC → External 5V 2A USB adapter via JST/DC terminal
+ *    GND → Common GND with Arduino
+ *    [DO NOT power A7670C from Arduino 5V pin — needs 2A]
+ *
+ *  Status LED (optional):
+ *    Anode → D13 (built-in LED on Nano)
+ *    Cathode → GND
+ *
+ *  NOTES
+ *  ─────
+ *  • The laser runs continuously. The LDR reads reflected/received
+ *    beam. When the beam is broken, LDR value drops below threshold.
+ *  • Insert your SIM phone number in ALERT_NUMBER below.
+ *  • Adjust LDR_THRESHOLD to match your environment (run serial
+ *    monitor first to read baseline values).
+ *  • COOLDOWN_MS prevents repeated alerts for the same intrusion.
+ * ============================================================
+ */
+
+#include <SoftwareSerial.h>
+
+// ── Pin Definitions ──────────────────────────────────────────
+#define LASER_PIN       7     // KY-008 signal pin
+#define LDR_PIN         A0    // LDR analog read
+#define LED_PIN         13    // Status LED (built-in on Nano)
+
+// ── GSM Serial (SoftwareSerial) ──────────────────────────────
+//    A7670C TX → Arduino D2, A7670C RX → Arduino D3
+SoftwareSerial gsmSerial(2, 3);   // (RX, TX)
+
+// ── Configuration ─────────────────────────────────────────────
+const char ALERT_NUMBER[]  = "+91XXXXXXXXXX";   // ← Change to your number
+const int  LDR_THRESHOLD   = 400;               // 0-1023; tune via serial monitor
+const unsigned long COOLDOWN_MS   = 30000UL;    // 30 s between repeated alerts
+const unsigned long CALL_DURATION = 15000UL;    // Call hangs up after 15 s
+const unsigned long GSM_TIMEOUT   = 8000UL;     // AT command timeout
+const int  BEAM_SAMPLES    = 5;                 // Average readings to reduce noise
+
+// ── State ────────────────────────────────────────────────────
+bool     beamBroken       = false;
+bool     gsmReady         = false;
+unsigned long lastAlertMs = 0;
+
+// ── Function Prototypes ──────────────────────────────────────
+void  initLaser();
+void  initGSM();
+bool  sendATCommand(const char* cmd, const char* expected, unsigned long timeout);
+void  sendSMS(const char* number, const char* message);
+void  makeCall(const char* number);
+void  hangUp();
+int   readLDRAverage();
+void  triggerAlert();
+void  blinkLED(int times, int delayMs);
+
+// ============================================================
+void setup() {
+  Serial.begin(9600);
+  gsmSerial.begin(9600);
+
+  pinMode(LASER_PIN, OUTPUT);
+  pinMode(LED_PIN,   OUTPUT);
+
+  Serial.println(F("=== Laser Guard System Starting ==="));
+
+  initLaser();
+  delay(1000);
+  initGSM();
+
+  Serial.println(F("System armed. Monitoring beam..."));
+  blinkLED(3, 200);   // 3 blinks = armed
+}
+
+// ============================================================
+void loop() {
+  int ldrValue = readLDRAverage();
+  Serial.print(F("LDR: "));
+  Serial.println(ldrValue);
+
+  bool beamCurrentlyBroken = (ldrValue < LDR_THRESHOLD);
+
+  if (beamCurrentlyBroken && !beamBroken) {
+    // Rising edge — beam just got broken
+    beamBroken = true;
+    Serial.println(F("!! BEAM BROKEN — INTRUSION DETECTED !!"));
+    digitalWrite(LED_PIN, HIGH);
+
+    unsigned long now = millis();
+    if (now - lastAlertMs > COOLDOWN_MS) {
+      lastAlertMs = now;
+      triggerAlert();
+    } else {
+      Serial.println(F("Cooldown active — skipping alert."));
+    }
+  }
+
+  if (!beamCurrentlyBroken && beamBroken) {
+    // Beam restored
+    beamBroken = false;
+    Serial.println(F("Beam restored."));
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  delay(200);   // Poll every 200 ms
+}
+
+// ── Laser Init ───────────────────────────────────────────────
+void initLaser() {
+  digitalWrite(LASER_PIN, HIGH);   // Turn laser ON
+  Serial.println(F("Laser ON."));
+}
+
+// ── GSM Init ─────────────────────────────────────────────────
+void initGSM() {
+  Serial.println(F("Initializing A7670C GSM module..."));
+  delay(3000);   // Wait for module boot
+
+  // Basic AT handshake
+  if (!sendATCommand("AT", "OK", GSM_TIMEOUT)) {
+    Serial.println(F("GSM not responding. Check wiring/power."));
+    blinkLED(10, 100);
+    return;
+  }
+
+  sendATCommand("ATE0",       "OK", GSM_TIMEOUT);   // Echo off
+  sendATCommand("AT+CMGF=1",  "OK", GSM_TIMEOUT);   // SMS text mode
+  sendATCommand("AT+CSCS=\"GSM\"", "OK", GSM_TIMEOUT); // GSM charset
+  sendATCommand("AT+CREG?",   "OK", GSM_TIMEOUT);   // Check registration
+
+  gsmReady = true;
+  Serial.println(F("GSM ready."));
+}
+
+// ── Send AT Command ───────────────────────────────────────────
+bool sendATCommand(const char* cmd, const char* expected, unsigned long timeout) {
+  while (gsmSerial.available()) gsmSerial.read();   // flush
+
+  gsmSerial.println(cmd);
+  Serial.print(F("AT> ")); Serial.println(cmd);
+
+  unsigned long start = millis();
+  String response = "";
+
+  while (millis() - start < timeout) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      response += c;
+    }
+    if (response.indexOf(expected) != -1) {
+      Serial.print(F("AT< ")); Serial.println(response);
+      return true;
+    }
+  }
+
+  Serial.print(F("AT< TIMEOUT / ")); Serial.println(response);
+  return false;
+}
+
+// ── Send SMS ─────────────────────────────────────────────────
+void sendSMS(const char* number, const char* message) {
+  if (!gsmReady) {
+    Serial.println(F("GSM not ready — skipping SMS."));
+    return;
+  }
+
+  Serial.println(F("Sending SMS..."));
+
+  // AT+CMGS="<number>"
+  gsmSerial.print(F("AT+CMGS=\""));
+  gsmSerial.print(number);
+  gsmSerial.println(F("\""));
+
+  delay(1000);   // Wait for '>' prompt
+
+  gsmSerial.print(message);
+  delay(100);
+  gsmSerial.write(26);   // Ctrl+Z to send
+
+  // Wait for +CMGS: confirmation
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < 10000UL) {
+    while (gsmSerial.available()) resp += (char)gsmSerial.read();
+    if (resp.indexOf("+CMGS:") != -1) {
+      Serial.println(F("SMS sent successfully."));
+      return;
+    }
+  }
+  Serial.println(F("SMS send timeout/failed."));
+}
+
+// ── Make Voice Call ──────────────────────────────────────────
+void makeCall(const char* number) {
+  if (!gsmReady) {
+    Serial.println(F("GSM not ready — skipping call."));
+    return;
+  }
+
+  Serial.println(F("Dialing..."));
+
+  gsmSerial.print(F("ATD"));
+  gsmSerial.print(number);
+  gsmSerial.println(F(";"));   // ';' for voice call (not data)
+
+  delay(CALL_DURATION);        // Let it ring for configured duration
+  hangUp();
+}
+
+// ── Hang Up ──────────────────────────────────────────────────
+void hangUp() {
+  sendATCommand("ATH", "OK", GSM_TIMEOUT);
+  Serial.println(F("Call ended."));
+}
+
+// ── Average LDR Readings ─────────────────────────────────────
+int readLDRAverage() {
+  long sum = 0;
+  for (int i = 0; i < BEAM_SAMPLES; i++) {
+    sum += analogRead(LDR_PIN);
+    delay(10);
+  }
+  return (int)(sum / BEAM_SAMPLES);
+}
+
+// ── Trigger Full Alert (SMS + Call) ──────────────────────────
+void triggerAlert() {
+  Serial.println(F("Sending SMS alert..."));
+  sendSMS(ALERT_NUMBER, "ALERT! Laser beam broken - INTRUSION DETECTED at your location!");
+
+  delay(2000);   // Brief pause between SMS and call
+
+  Serial.println(F("Making voice call alert..."));
+  makeCall(ALERT_NUMBER);
+}
+
+// ── Blink LED Helper ─────────────────────────────────────────
+void blinkLED(int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(delayMs);
+    digitalWrite(LED_PIN, LOW);
+    delay(delayMs);
+  }
+}
